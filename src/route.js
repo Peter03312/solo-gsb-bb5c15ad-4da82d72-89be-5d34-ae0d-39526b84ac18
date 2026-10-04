@@ -25,50 +25,126 @@ const MAX_TITLE_LEN = 200;
 
 // ---------- 见证链求解 ----------
 // 在该版关系图中求 fromId → toId 的一条有向路径：
-//   1. 关系数最少（BFS 按层扩展，首次到达即最少）；
+//   1. 关系数最少（即图上的最短路径）；
 //   2. 同长度时关系 ID 序列字典序最小。
 // relations: [{relationId, earlierEventId, laterEventId}]（已发布版本必为 DAG）。
 // 返回 { eventIds, relationIds }；不可达返回 null。
-function shortestWitnessChain(relations, fromId, toId) {
-  const adj = new Map(); // eventId -> [{to, relationId}]（按关系 id 升序，利于尽早发现小序列）
+//
+// 长链性能：旧实现为每个节点保存整条路径（每扩展一层就复制一次路径数组），
+// 链长 L 时单段即复制 O(L²) 个元素——两万事件顺链的首尾一段需数秒，
+// 创建请求难以及时完成。这里改为全程 O(V+E) 时间、O(V) 额外空间的实现：
+//   1) 正向 BFS（头指针队列）求各点距 fromId 的最少关系数 distFrom，
+//      toId 出队即停（更深的点不可能在最短路上）；
+//   2) 反向 BFS 求各点距 toId 的最少关系数 distTo（深度超过总长的点不再扩展）；
+//   3) 逐层贪心：只在最短路上的点（distFrom + distTo === 总长）之间扩展，
+//      每层取当前前沿集合出发边中的最小关系 ID，并为下一层各点记录父指针；
+//   4) 由父指针从 toId 回溯出整条链。
+// 结果与「逐层为每个节点保留字典序最小序列」完全一致：最短路径的任意前缀
+// 本身也是最短路径，故逐层取最小关系 ID 即得字典序最小的关系 ID 序列；
+// 关系 ID 唯一，关系序列唯一决定事件序列。
+
+// 由关系数组建立正 / 反向邻接表（建一次可供多段复用）。
+// outEdgesOf(u)：u 沿 较早→较晚 方向的出边 [{node, relationId}]；
+// inEdgesOf(v)：v 的反向边 [{node, relationId}]（node 为另一端事件）。
+function buildRelationGraph(relations) {
+  const out = new Map(); // eventId -> [{node, relationId}]
+  const inn = new Map(); // eventId -> [{node, relationId}]（反向）
   for (const r of relations) {
-    if (!adj.has(r.earlierEventId)) adj.set(r.earlierEventId, []);
-    adj.get(r.earlierEventId).push({ to: r.laterEventId, relationId: r.relationId });
+    if (!out.has(r.earlierEventId)) out.set(r.earlierEventId, []);
+    out.get(r.earlierEventId).push({ node: r.laterEventId, relationId: r.relationId });
+    if (!inn.has(r.laterEventId)) inn.set(r.laterEventId, []);
+    inn.get(r.laterEventId).push({ node: r.earlierEventId, relationId: r.relationId });
   }
-  for (const edges of adj.values()) edges.sort((a, b) => a.relationId - b.relationId);
-
-  // seqLess：等长序列按字典序比较
-  const seqLess = (a, b) => {
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return a[i] < b[i];
-    }
-    return false;
+  return {
+    outEdgesOf: (u) => out.get(u) || [],
+    inEdgesOf: (u) => inn.get(u) || [],
   };
+}
 
-  // 分层 BFS：每个节点只在其最浅层保留一条字典序最小的关系序列。
-  // 最短路径的任意前缀本身也是到该点的最短路径，故按层保留最小序列不会丢失最优解。
-  const depth = new Map([[fromId, 0]]);
-  let frontier = new Map([[fromId, { eventIds: [fromId], relationIds: [] }]]);
-  let d = 0;
-  while (frontier.size) {
-    const next = new Map(); // eventId -> 该层最优链
-    for (const [u, chainU] of frontier) {
-      for (const { to, relationId } of adj.get(u) || []) {
-        if (depth.has(to)) continue; // 已在更浅层到达过
-        const candidate = {
-          eventIds: [...chainU.eventIds, to],
-          relationIds: [...chainU.relationIds, relationId],
-        };
-        const cur = next.get(to);
-        if (!cur || seqLess(candidate.relationIds, cur.relationIds)) next.set(to, candidate);
+// 在已建好的正 / 反向邻接图上求 fromId → toId 的最少关系见证链。
+function shortestWitnessChainOnGraph(graph, fromId, toId) {
+  if (fromId === toId) return null; // 不返回零长度链（路线锚点本就互异；与旧行为一致）
+
+  // 1) 正向 BFS：fromId 到各点的最少关系数。toId 出队即停——BFS 按层出队，
+  //    此时所有深度 ≤ dist(toId) 的点都已记录，更深的点与最短路无关。
+  const distFrom = new Map([[fromId, 0]]);
+  const queue = [fromId];
+  let total = -1;
+  for (let head = 0; head < queue.length; head++) {
+    const u = queue[head];
+    const d = distFrom.get(u);
+    if (u === toId) {
+      total = d;
+      break;
+    }
+    for (const e of graph.outEdgesOf(u)) {
+      if (distFrom.has(e.node)) continue; // 已在更浅层到达过
+      distFrom.set(e.node, d + 1);
+      queue.push(e.node);
+    }
+  }
+  if (total < 0) return null; // 不可达
+
+  // 2) 反向 BFS：各点到 toId 的最少关系数；深度超过 total 的点不可能在最短路上，不再扩展。
+  const distTo = new Map([[toId, 0]]);
+  const rqueue = [toId];
+  for (let head = 0; head < rqueue.length; head++) {
+    const u = rqueue[head];
+    const d = distTo.get(u);
+    if (d === total) continue;
+    for (const e of graph.inEdgesOf(u)) {
+      if (distTo.has(e.node)) continue;
+      distTo.set(e.node, d + 1);
+      rqueue.push(e.node);
+    }
+  }
+
+  // 3) 逐层贪心：frontier 为「以当前字典序最小前缀可达」的同层点集。
+  //    每层在 前沿 → 下一层 且落在某条最短路上的边中取最小关系 ID，
+  //    并以该关系 ID 的边扩展出下一层点集、记录父指针（供回溯具体链）。
+  const parent = new Map(); // eventId -> { fromEventId, relationId }
+  const relationIds = [];
+  let frontier = [fromId];
+  for (let d = 0; d < total; d++) {
+    let best = Infinity;
+    for (const u of frontier) {
+      for (const e of graph.outEdgesOf(u)) {
+        if (distFrom.get(e.node) !== d + 1) continue; // 只走向下一层的边
+        if (distTo.get(e.node) !== total - d - 1) continue; // 只走最短路上的点
+        if (e.relationId < best) best = e.relationId;
       }
     }
-    d += 1;
-    for (const id of next.keys()) depth.set(id, d);
-    if (next.has(toId)) return next.get(toId);
+    relationIds.push(best);
+    const next = [];
+    const seen = new Set();
+    for (const u of frontier) {
+      for (const e of graph.outEdgesOf(u)) {
+        if (e.relationId !== best) continue;
+        if (distFrom.get(e.node) !== d + 1) continue;
+        if (distTo.get(e.node) !== total - d - 1) continue;
+        if (seen.has(e.node)) continue;
+        seen.add(e.node);
+        next.push(e.node);
+        parent.set(e.node, { fromEventId: u, relationId: best });
+      }
+    }
     frontier = next;
   }
-  return null;
+
+  // 4) 由父指针从 toId 回溯整条链（关系 ID 唯一，回溯所得即字典序最小序列对应的链）
+  const eventIds = [toId];
+  let cur = toId;
+  while (cur !== fromId) {
+    cur = parent.get(cur).fromEventId;
+    eventIds.push(cur);
+  }
+  eventIds.reverse();
+  return { eventIds, relationIds };
+}
+
+// 单段入口（保持既有签名）：自建邻接图后求解。
+function shortestWitnessChain(relations, fromId, toId) {
+  return shortestWitnessChainOnGraph(buildRelationGraph(relations), fromId, toId);
 }
 
 // ---------- 建立路线 ----------
@@ -137,13 +213,15 @@ function createRoute({ title, versionNo, anchorEventIds, editor = '', note = '' 
     };
   }
 
-  // 5) 逐段求见证链；任何一段不可达即拒绝整条路线并指出全部断点
+  // 5) 逐段求见证链；任何一段不可达即拒绝整条路线并指出全部断点。
+  //    正 / 反向邻接图只建一次，全部段复用（长链 + 多锚点时避免重复建图）。
+  const graph = buildRelationGraph(version.relations);
   const segments = [];
   const broken = [];
   for (let i = 0; i < anchors.length - 1; i++) {
     const from = anchors[i];
     const to = anchors[i + 1];
-    const chain = shortestWitnessChain(version.relations, from, to);
+    const chain = shortestWitnessChainOnGraph(graph, from, to);
     if (!chain) {
       broken.push({
         type: 'disconnected',
@@ -330,6 +408,7 @@ function listRoutes() {
 
 module.exports = {
   MAX_TITLE_LEN,
+  buildRelationGraph,
   shortestWitnessChain,
   createRoute,
   getRouteDetail,

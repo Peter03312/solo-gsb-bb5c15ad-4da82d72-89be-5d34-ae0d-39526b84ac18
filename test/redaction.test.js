@@ -694,8 +694,8 @@ test('预约发布到期生成的版本同样按 trim 规则自动遮盖', async
   });
   assert.strictEqual(sch.status, 201, JSON.stringify(sch.json));
   const scheduleNo = sch.json.schedule.scheduleNo;
-  // 等待预约到期后由调度器补跑
-  await new Promise((resolve) => setTimeout(resolve, 1200));
+  // 等待预约确实到期（到期时刻为 +1500ms，留足余量避免定时器提前触发的竞态），再手动补跑
+  await new Promise((resolve) => setTimeout(resolve, 1800));
   runDueSchedules();
   const detail = await call('GET', `/api/editor/schedules/${scheduleNo}`);
   assert.strictEqual(detail.json.schedule.status, 'published', JSON.stringify(detail.json.schedule));
