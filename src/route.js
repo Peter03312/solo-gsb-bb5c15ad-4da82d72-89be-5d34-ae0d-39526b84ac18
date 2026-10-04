@@ -25,50 +25,88 @@ const MAX_TITLE_LEN = 200;
 
 // ---------- 见证链求解 ----------
 // 在该版关系图中求 fromId → toId 的一条有向路径：
-//   1. 关系数最少（BFS 按层扩展，首次到达即最少）；
+//   1. 关系数最少（边数最少的最短路）；
 //   2. 同长度时关系 ID 序列字典序最小。
 // relations: [{relationId, earlierEventId, laterEventId}]（已发布版本必为 DAG）。
-// 返回 { eventIds, relationIds }；不可达返回 null。
-function shortestWitnessChain(relations, fromId, toId) {
-  const adj = new Map(); // eventId -> [{to, relationId}]（按关系 id 升序，利于尽早发现小序列）
-  for (const r of relations) {
-    if (!adj.has(r.earlierEventId)) adj.set(r.earlierEventId, []);
-    adj.get(r.earlierEventId).push({ to: r.laterEventId, relationId: r.relationId });
-  }
-  for (const edges of adj.values()) edges.sort((a, b) => a.relationId - b.relationId);
-
-  // seqLess：等长序列按字典序比较
-  const seqLess = (a, b) => {
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return a[i] < b[i];
+// 返回 { eventIds, relationIds }；不可达（含 fromId === toId）返回 null。
+//
+// 旧实现按层复制整条候选路径，两万事件顺链时每层都拷贝长度 O(n) 的数组，
+// 总开销 O(n²) 且产生大量短命大数组，创建请求无法及时完成。现改为两遍
+// 线性扫描（逆向分层 + 正向贪心重建），全程只存「前驱一条边」，不复制路径，
+// 长链下时间 O(V+E)、额外空间 O(V+E)。
+function buildWitnessGraph(relations) {
+  const fwd = new Map(); // eventId -> [{to, relationId}]
+  const rev = new Map(); // eventId -> [fromEventId]
+  const ensure = (m, id) => {
+    let list = m.get(id);
+    if (!list) {
+      list = [];
+      m.set(id, list);
     }
-    return false;
+    return list;
   };
+  for (const r of relations) {
+    ensure(fwd, r.earlierEventId).push({ to: r.laterEventId, relationId: r.relationId });
+    ensure(rev, r.laterEventId).push(r.earlierEventId);
+  }
+  // 正向出边按关系 id 升序：贪心重建取首条即字典序最小，也让遍历顺序确定。
+  for (const edges of fwd.values()) edges.sort((a, b) => a.relationId - b.relationId);
+  return { fwd, rev };
+}
 
-  // 分层 BFS：每个节点只在其最浅层保留一条字典序最小的关系序列。
-  // 最短路径的任意前缀本身也是到该点的最短路径，故按层保留最小序列不会丢失最优解。
-  const depth = new Map([[fromId, 0]]);
-  let frontier = new Map([[fromId, { eventIds: [fromId], relationIds: [] }]]);
-  let d = 0;
-  while (frontier.size) {
-    const next = new Map(); // eventId -> 该层最优链
-    for (const [u, chainU] of frontier) {
-      for (const { to, relationId } of adj.get(u) || []) {
-        if (depth.has(to)) continue; // 已在更浅层到达过
-        const candidate = {
-          eventIds: [...chainU.eventIds, to],
-          relationIds: [...chainU.relationIds, relationId],
-        };
-        const cur = next.get(to);
-        if (!cur || seqLess(candidate.relationIds, cur.relationIds)) next.set(to, candidate);
+// 图上的见证链求解。图可跨多段锚点复用（同一路线只建一次）。
+function shortestWitnessChainOnGraph(graph, fromId, toId) {
+  if (fromId === toId) return null;
+  const { fwd, rev } = graph;
+
+  // 第一遍：从 toId 在逆向图（later → earlier）上做 BFS，
+  // dist[v] = v → toId 的最短边数。到 fromId 即可提前结束。
+  const dist = new Map([[toId, 0]]);
+  const queue = [toId];
+  for (let head = 0; head < queue.length; head++) {
+    const v = queue[head];
+    if (v === fromId) break;
+    const d = dist.get(v);
+    for (const u of rev.get(v) || []) {
+      if (!dist.has(u)) {
+        dist.set(u, d + 1);
+        queue.push(u);
       }
     }
-    d += 1;
-    for (const id of next.keys()) depth.set(id, d);
-    if (next.has(toId)) return next.get(toId);
-    frontier = next;
   }
-  return null;
+  if (!dist.has(fromId)) return null;
+
+  // 第二遍：从 fromId 沿正向图贪心走到 toId。
+  // 每一步只考虑「仍在最短路上」的边（dist[u] = dist[v] - 1），
+  // 取其中关系 id 最小者；出边已按关系 id 升序，命中第一条即可。
+  //
+  // 为什么得到字典序最小序列：归纳。第 k 步设已选前缀 P。任何最短路的下一条
+  // 边必须落在 dist 恰好减 1 的出边上（否则剩余步数无法归零，违反边数最少）。
+  // 取其中最小关系 id a：选更大 id 的候选整条序列在第 k 位即更大；而选 a 之后
+  // 到 toId 仍有最短路（dist 保证），对剩余段同理归纳即可补上字典序最小后缀。
+  const eventIds = [fromId];
+  const relationIds = [];
+  let cur = fromId;
+  while (cur !== toId) {
+    const want = dist.get(cur) - 1;
+    let pick = null;
+    for (const e of fwd.get(cur) || []) {
+      if (dist.get(e.to) === want) {
+        pick = e;
+        break; // 出边按 relationId 升序，首条即最小
+      }
+    }
+    // dist 已保证 fromId 可达 toId 且每步都有使 dist 减 1 的出边，pick 必非空
+    eventIds.push(pick.to);
+    relationIds.push(pick.relationId);
+    cur = pick.to;
+  }
+  return { eventIds, relationIds };
+}
+
+// 兼容旧调用方式的包装（测试与外部调用直接传关系数组）。
+function shortestWitnessChain(relations, fromId, toId) {
+  return shortestWitnessChainOnGraph(buildWitnessGraph(relations), fromId, toId);
 }
 
 // ---------- 建立路线 ----------
@@ -137,13 +175,15 @@ function createRoute({ title, versionNo, anchorEventIds, editor = '', note = '' 
     };
   }
 
-  // 5) 逐段求见证链；任何一段不可达即拒绝整条路线并指出全部断点
+  // 5) 逐段求见证链；任何一段不可达即拒绝整条路线并指出全部断点。
+  //    该版关系图只构建一次，各段共享（避免多锚点时重复建图）。
+  const graph = buildWitnessGraph(version.relations);
   const segments = [];
   const broken = [];
   for (let i = 0; i < anchors.length - 1; i++) {
     const from = anchors[i];
     const to = anchors[i + 1];
-    const chain = shortestWitnessChain(version.relations, from, to);
+    const chain = shortestWitnessChainOnGraph(graph, from, to);
     if (!chain) {
       broken.push({
         type: 'disconnected',
@@ -330,7 +370,9 @@ function listRoutes() {
 
 module.exports = {
   MAX_TITLE_LEN,
+  buildWitnessGraph,
   shortestWitnessChain,
+  shortestWitnessChainOnGraph,
   createRoute,
   getRouteDetail,
   applyRedactionToRoute,
